@@ -1,6 +1,7 @@
 package zstd
 
 /*
+#define ZSTD_STATIC_LINKING_ONLY
 #include "zstd.h"
 
 typedef struct compressStream2_result_s {
@@ -65,6 +66,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -132,6 +134,49 @@ func NewWriterLevelDict(w io.Writer, level int, dict []byte) *Writer {
 	if err == nil {
 		// Only set level if the ctx is not in error already
 		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_compressionLevel, C.int(level))))
+	}
+
+	return &Writer{
+		CompressionLevel: level,
+		ctx:              ctx,
+		dict:             dict,
+		srcBuffer:        make([]byte, 0),
+		dstBuffer:        make([]byte, CompressBound(1024)),
+		firstError:       err,
+		underlyingWriter: w,
+		resultBuffer:     new(C.compressStream2_result),
+	}
+}
+
+// Like NewWriterLevelDict but with settings like --patch-from
+func NewWriterPatcher(w io.Writer, level int, dict []byte, pledgedSrcSize int64) *Writer {
+	var err error
+	ctx := C.ZSTD_createCStream()
+
+	if err == nil {
+		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_compressionLevel, C.int(level))))
+	}
+	if err == nil && dict != nil {
+		dictLogSize := bits.Len(uint(len(dict)))
+		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_windowLog, C.int(dictLogSize))))
+	}
+	// doesn't seem to help for single-shot case at least:
+	// if err == nil {
+	// 	err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_enableDedicatedDictSearch, C.int(1))))
+	// }
+	if err == nil {
+		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_enableLongDistanceMatching, C.int(1))))
+	}
+	if err == nil && pledgedSrcSize > 0 {
+		err = getError(int(C.ZSTD_CCtx_setPledgedSrcSize(ctx, C.ulonglong(pledgedSrcSize))))
+	}
+
+	if err == nil && dict != nil {
+		// this keeps a reference, dict must outlive the ctx now
+		err = getError(int(C.ZSTD_CCtx_refPrefix(ctx,
+			unsafe.Pointer(&dict[0]),
+			C.size_t(len(dict)),
+		)))
 	}
 
 	return &Writer{
@@ -402,6 +447,42 @@ func NewReaderDict(r io.Reader, dict []byte) io.ReadCloser {
 		if err == nil {
 			// Only load dictionary if we succesfully inited the context
 			err = getError(int(C.ZSTD_DCtx_loadDictionary(
+				ctx,
+				unsafe.Pointer(&dict[0]),
+				C.size_t(len(dict)))))
+		}
+	}
+	compressionBufferP := cPool.Get().(*[]byte)
+	decompressionBufferP := dPool.Get().(*[]byte)
+	return &reader{
+		ctx:                 ctx,
+		dict:                dict,
+		compressionBuffer:   *compressionBufferP,
+		decompressionBuffer: *decompressionBufferP,
+		firstError:          err,
+		recommendedSrcSize:  cSize,
+		resultBuffer:        new(C.decompressStream2_result),
+		underlyingReader:    r,
+	}
+}
+
+// Like NewReaderDict but with settings like --patch-from
+func NewReaderPatcher(r io.Reader, dict []byte) io.ReadCloser {
+	var err error
+	ctx := C.ZSTD_createDStream()
+	if len(dict) == 0 {
+		err = getError(int(C.ZSTD_initDStream(ctx)))
+	} else {
+		err = getError(int(C.ZSTD_DCtx_reset(ctx, C.ZSTD_reset_session_only)))
+		if err == nil {
+			dictLogSize := bits.Len(uint(len(dict)))
+			if dictLogSize > 27 {
+				err = getError(int(C.ZSTD_DCtx_setParameter(ctx, C.ZSTD_d_windowLogMax, C.int(dictLogSize))))
+			}
+		}
+		if err == nil {
+			// this keeps a reference, dict must outlive the ctx now
+			err = getError(int(C.ZSTD_DCtx_refPrefix(
 				ctx,
 				unsafe.Pointer(&dict[0]),
 				C.size_t(len(dict)))))
