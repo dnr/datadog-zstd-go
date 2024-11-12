@@ -157,7 +157,13 @@ func NewWriterPatcher(w io.Writer, level int, dict []byte, pledgedSrcSize int64)
 		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_compressionLevel, C.int(level))))
 	}
 	if err == nil && dict != nil {
+		// must be clamped in [10, 31]
 		dictLogSize := bits.Len(uint(len(dict)))
+		if dictLogSize < 10 {
+			dictLogSize = 10
+		} else if dictLogSize > 31 {
+			dictLogSize = 31
+		}
 		err = getError(int(C.ZSTD_CCtx_setParameter(ctx, C.ZSTD_c_windowLog, C.int(dictLogSize))))
 	}
 	// doesn't seem to help for single-shot case at least:
